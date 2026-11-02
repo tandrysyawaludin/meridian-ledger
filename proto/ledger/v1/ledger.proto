@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package meridian.ledger.v1;
+
+option go_package = "github.com/tandrysyawaludin/meridian-ledger/gen/ledger/v1;ledgerv1";
+
+// LedgerService mirrors the HTTP API surface (see internal/api) over gRPC.
+// All amounts are integer minor units (cents, sen, fils); there is no
+// float anywhere in the money path. Timestamps are RFC 3339 strings in
+// the HTTP API and google.protobuf.Timestamp here.
+service LedgerService {
+  rpc CreateAccount(CreateAccountRequest) returns (Account);
+  rpc GetAccount(GetAccountRequest) returns (Account);
+  rpc PostTransaction(PostTransactionRequest) returns (Transaction);
+  rpc GetTransaction(GetTransactionRequest) returns (Transaction);
+  rpc GetBalance(GetBalanceRequest) returns (Balance);
+}
+
+message Account {
+  string id = 1;
+  string name = 2;
+  // ISO 4217 currency code, e.g. "USD", "JPY".
+  string currency = 3;
+  string created_at = 4; // RFC 3339.
+}
+
+message Entry {
+  string account_id = 1;
+  // "debit" or "credit".
+  string direction = 2;
+  // Minor units, strictly positive.
+  int64 amount_minor = 3;
+}
+
+message Transaction {
+  string id = 1;
+  string idempotency_key = 2;
+  string memo = 3;
+  repeated Entry entries = 4;
+  string created_at = 5; // RFC 3339.
+}
+
+message Balance {
+  string account_id = 1;
+  // Minor units, debits minus credits.
+  int64 balance_minor = 2;
+  string currency = 3;
+  // Optimistic-concurrency version: increments on every posting that
+  // touches the account. A snapshot read at version V is stale once the
+  // account's version moves past V.
+  int64 version = 4;
+}
+
+message CreateAccountRequest {
+  string id = 1;
+  string name = 2;
+  string currency = 3;
+}
+
+message GetAccountRequest {
+  string id = 1;
+}
+
+message PostTransactionRequest {
+  string idempotency_key = 1;
+  string memo = 2;
+  repeated Entry entries = 3;
+}
+
+message GetTransactionRequest {
+  string id = 1;
+}
+
+message GetBalanceRequest {
+  string account_id = 1;
+}

@@ -16,7 +16,9 @@ type MemoryStore struct {
 	mu       sync.RWMutex
 	accounts map[string]ledger.Account
 	journal  []ledger.Transaction
-	byKey    map[string]int // idempotency key -> index into journal
+	byKey    map[string]int   // idempotency key -> index into journal
+	byID     map[string]int   // transaction id -> index into journal
+	versions map[string]int64 // account id -> optimistic-concurrency version
 }
 
 // NewMemoryStore returns an empty in-memory store.
@@ -24,6 +26,8 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		accounts: make(map[string]ledger.Account),
 		byKey:    make(map[string]int),
+		byID:     make(map[string]int),
+		versions: make(map[string]int64),
 	}
 }
 
@@ -58,8 +62,57 @@ func (m *MemoryStore) SaveTransaction(_ context.Context, tx ledger.Transaction) 
 	stored := tx
 	stored.Entries = append([]ledger.Entry(nil), tx.Entries...)
 	m.byKey[tx.IdempotencyKey] = len(m.journal)
+	m.byID[tx.ID] = len(m.journal)
+	// One version bump per transaction per account, matching the Postgres
+	// store's per-posting version increment.
+	seen := make(map[string]bool)
+	for _, e := range tx.Entries {
+		if !seen[e.AccountID] {
+			seen[e.AccountID] = true
+			m.versions[e.AccountID]++
+		}
+	}
 	m.journal = append(m.journal, stored)
 	return nil
+}
+
+// Transaction returns a single journal entry by ID.
+func (m *MemoryStore) Transaction(_ context.Context, id string) (ledger.Transaction, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	idx, ok := m.byID[id]
+	if !ok {
+		return ledger.Transaction{}, ledger.ErrTransactionNotFound
+	}
+	tx := m.journal[idx]
+	tx.Entries = append([]ledger.Entry(nil), tx.Entries...)
+	return tx, nil
+}
+
+// BalanceSnapshot derives the balance from the journal and pairs it with
+// the account's current version, under a single lock hold so the pair is
+// always consistent.
+func (m *MemoryStore) BalanceSnapshot(_ context.Context, accountID string) (ledger.BalanceSnapshot, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.accounts[accountID]; !ok {
+		return ledger.BalanceSnapshot{}, ledger.ErrAccountNotFound
+	}
+	var balance int64
+	for _, tx := range m.journal {
+		for _, e := range tx.Entries {
+			if e.AccountID != accountID {
+				continue
+			}
+			switch e.Direction {
+			case ledger.Debit:
+				balance += e.Amount
+			case ledger.Credit:
+				balance -= e.Amount
+			}
+		}
+	}
+	return ledger.BalanceSnapshot{AccountID: accountID, Balance: balance, Version: m.versions[accountID]}, nil
 }
 
 // TransactionByIdempotencyKey looks up a previously posted transaction by

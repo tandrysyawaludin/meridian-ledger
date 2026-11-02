@@ -80,12 +80,30 @@ type PostRequest struct {
 // Implementations must preserve insertion order for transactions and must
 // treat the journal as append-only: transactions are never updated or
 // deleted, only superseded by new reversing transactions.
+// BalanceSnapshot is a point-in-time balance read together with the
+// account version it was read at. The version increments on every posting
+// that touches the account, so a reader doing optimistic concurrency can
+// detect a concurrent change simply by comparing versions: if the version
+// moved, the snapshot is stale and the read must be retried. Stores return
+// the balance and the version from a single consistent read, never from two
+// separate queries that a concurrent posting could slip between.
+type BalanceSnapshot struct {
+	AccountID string
+	Balance   int64 // Minor units, debits minus credits.
+	Version   int64 // Monotonic per account; increments per touching posting.
+	AsOf      time.Time
+}
+
 type Repository interface {
 	CreateAccount(ctx context.Context, account Account) error
 	Account(ctx context.Context, id string) (Account, error)
 	SaveTransaction(ctx context.Context, tx Transaction) error
+	Transaction(ctx context.Context, id string) (Transaction, error)
 	TransactionByIdempotencyKey(ctx context.Context, key string) (tx Transaction, found bool, err error)
 	TransactionsForAccount(ctx context.Context, accountID string) ([]Transaction, error)
+	// BalanceSnapshot returns the account's derived balance together with
+	// its optimistic-concurrency version, from a single consistent read.
+	BalanceSnapshot(ctx context.Context, accountID string) (BalanceSnapshot, error)
 }
 
 // Domain errors. Callers should match these with errors.Is.
@@ -101,6 +119,7 @@ var (
 	ErrMixedCurrencies     = errors.New("ledger: all accounts in a transaction must share one currency")
 	ErrEmptyAccountID      = errors.New("ledger: entry account id is required")
 	ErrInvalidAccount      = errors.New("ledger: account id, name and currency are required")
+	ErrTransactionNotFound = errors.New("ledger: transaction not found")
 )
 
 // Service is the double-entry ledger. It is safe for concurrent use.
@@ -184,34 +203,35 @@ func (s *Service) Post(ctx context.Context, req PostRequest) (Transaction, error
 	return tx, nil
 }
 
+// Transaction returns a single posted transaction by ID.
+func (s *Service) Transaction(ctx context.Context, id string) (Transaction, error) {
+	return s.repo.Transaction(ctx, id)
+}
+
+// BalanceSnapshot returns an account's balance together with the version
+// it was read at, for optimistic-concurrency reads (see BalanceSnapshot).
+func (s *Service) BalanceSnapshot(ctx context.Context, accountID string) (BalanceSnapshot, error) {
+	snap, err := s.repo.BalanceSnapshot(ctx, accountID)
+	if err != nil {
+		return BalanceSnapshot{}, err
+	}
+	if snap.AsOf.IsZero() {
+		snap.AsOf = s.now().UTC()
+	}
+	return snap, nil
+}
+
 // Balance derives an account's balance from the journal: total debits minus
 // total credits, in minor units. A positive balance is a net debit balance,
 // which is the normal state for asset and expense accounts; liability,
 // equity and revenue accounts normally carry a net credit (negative) balance
 // under this convention.
 func (s *Service) Balance(ctx context.Context, accountID string) (int64, error) {
-	if _, err := s.repo.Account(ctx, accountID); err != nil {
-		return 0, err
-	}
-	txs, err := s.repo.TransactionsForAccount(ctx, accountID)
+	snap, err := s.BalanceSnapshot(ctx, accountID)
 	if err != nil {
 		return 0, err
 	}
-	var balance int64
-	for _, tx := range txs {
-		for _, e := range tx.Entries {
-			if e.AccountID != accountID {
-				continue
-			}
-			switch e.Direction {
-			case Debit:
-				balance += e.Amount
-			case Credit:
-				balance -= e.Amount
-			}
-		}
-	}
-	return balance, nil
+	return snap.Balance, nil
 }
 
 // validateEntries enforces the structural invariants of a posting: entry

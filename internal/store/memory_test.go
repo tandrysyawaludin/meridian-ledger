@@ -60,11 +60,58 @@ func TestMemoryStoreJournalIsAppendOnlyAndCopied(t *testing.T) {
 	}
 }
 
-func TestPostgresStoreIsAStubForNow(t *testing.T) {
+func TestMemoryStoreTransactionLookupAndSnapshotVersions(t *testing.T) {
 	ctx := context.Background()
-	s := store.NewPostgresStore("postgres://localhost:5432/meridian")
+	s := store.NewMemoryStore()
+	svc := ledger.NewService(s)
 
-	if err := s.CreateAccount(ctx, ledger.Account{ID: "x"}); !errors.Is(err, store.ErrNotImplemented) {
-		t.Fatalf("err = %v, want ErrNotImplemented until the Day 2 pgx implementation lands", err)
+	for _, acct := range []ledger.Account{
+		{ID: "cash", Name: "Cash", Currency: "USD"},
+		{ID: "revenue", Name: "Revenue", Currency: "USD"},
+	} {
+		if _, err := svc.CreateAccount(ctx, acct); err != nil {
+			t.Fatalf("create account %s: %v", acct.ID, err)
+		}
+	}
+
+	// Version starts at 0 and the balance is empty before any posting.
+	snap, err := s.BalanceSnapshot(ctx, "cash")
+	if err != nil {
+		t.Fatalf("initial snapshot: %v", err)
+	}
+	if snap.Balance != 0 || snap.Version != 0 {
+		t.Fatalf("initial snapshot = %+v, want balance 0 version 0", snap)
+	}
+
+	tx, err := svc.Post(ctx, ledger.PostRequest{
+		IdempotencyKey: "sale-1",
+		Entries: []ledger.Entry{
+			{AccountID: "cash", Direction: ledger.Debit, Amount: 5000},
+			{AccountID: "revenue", Direction: ledger.Credit, Amount: 5000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	// One posting bumps each touched account's version exactly once.
+	snap, err = s.BalanceSnapshot(ctx, "cash")
+	if err != nil {
+		t.Fatalf("snapshot after posting: %v", err)
+	}
+	if snap.Balance != 5000 || snap.Version != 1 {
+		t.Fatalf("snapshot = %+v, want balance 5000 version 1", snap)
+	}
+
+	// Transaction lookup by ID, and the not-found error.
+	got, err := s.Transaction(ctx, tx.ID)
+	if err != nil || got.IdempotencyKey != "sale-1" {
+		t.Fatalf("lookup by id: tx=%+v err=%v", got, err)
+	}
+	if _, err := s.Transaction(ctx, "missing"); !errors.Is(err, ledger.ErrTransactionNotFound) {
+		t.Fatalf("missing tx err = %v, want ErrTransactionNotFound", err)
+	}
+	if _, err := s.BalanceSnapshot(ctx, "missing"); !errors.Is(err, ledger.ErrAccountNotFound) {
+		t.Fatalf("missing account snapshot err = %v, want ErrAccountNotFound", err)
 	}
 }

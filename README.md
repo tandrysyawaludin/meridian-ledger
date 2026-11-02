@@ -41,7 +41,7 @@ flowchart LR
     SVC -->|validates invariants<br/>+ idempotency| SVC
     SVC --> Repo[(Repository port)]
     Repo --> Mem[In-memory store<br/>tests / local dev]
-    Repo --> PG[(Postgres store<br/>pgx — Day 2)]
+    Repo --> PG[(Postgres store<br/>pgx)]
     SVC -.->|transactional outbox — Day 3| Outbox[Event stream<br/>Kafka / Redpanda]
     Outbox --> Consumers[Downstream consumers<br/>dedup + DLQ]
     SVC -.-> Metrics[Metrics / logs / traces — Day 4]
@@ -55,10 +55,16 @@ exercise exactly the same invariant and idempotency logic.
 ## Layout
 
 ```
-cmd/meridian/        Service entry point (HTTP server, health endpoints)
+cmd/meridian/        Service entry point (HTTP + gRPC servers, health endpoints)
 internal/ledger/     Double-entry domain: accounts, entries, transactions,
-                     invariant + idempotency enforcement, balance derivation
-internal/store/      Store interface, in-memory implementation, Postgres stub
+                     invariant + idempotency enforcement, balance derivation,
+                     versioned balance snapshots
+internal/store/      Store interface, in-memory implementation, pgx Postgres
+                     implementation (schema in internal/store/schema.sql)
+internal/api/        HTTP JSON API (same contract as the gRPC surface)
+internal/grpcapi/    gRPC adapter over the generated protobuf service
+gen/ledger/v1/       Generated protobuf + gRPC code (from proto/ledger/v1/)
+proto/ledger/v1/     Protobuf service definition (source of truth)
 ```
 
 ## Key design decisions
@@ -92,21 +98,65 @@ Requires Go 1.24+ (developed against the latest stable Go).
 go build ./...
 go test ./...
 
-# Start the service (in-memory store, health endpoints on :8080)
+# Start the service (in-memory store; HTTP on :8080, gRPC on :9090)
 go run ./cmd/meridian
 
 curl localhost:8080/healthz
 # {"service":"meridian-ledger","status":"ok"}
 ```
 
-Configuration: `PORT` sets the listen port (default `8080`).
+Configuration: `PORT` sets the HTTP listen port (default `8080`),
+`GRPC_PORT` the gRPC port (default `9090`), and `DATABASE_URL` selects
+the Postgres store (a Postgres connection string). When `DATABASE_URL`
+is unset, the in-memory store is used.
+
+### API
+
+HTTP (JSON, under `/api`):
+
+```sh
+curl -X POST localhost:8080/api/accounts \
+  -d '{"id":"cash","name":"Cash","currency":"USD"}'
+curl -X POST localhost:8080/api/transactions \
+  -d '{"idempotency_key":"sale-1","memo":"card sale","entries":[
+        {"account_id":"cash","direction":"debit","amount_minor":5000},
+        {"account_id":"revenue","direction":"credit","amount_minor":5000}]}'
+curl localhost:8080/api/accounts/cash/balance
+# {"account_id":"cash","balance_minor":5000,"currency":"USD","version":1}
+```
+
+The balance response carries a `version` that increments on every posting
+touching the account: a snapshot read at version V is stale as soon as the
+version moves, which is the optimistic-concurrency signal for readers.
+
+The gRPC surface mirrors the HTTP API exactly; see
+[`proto/ledger/v1/ledger.proto`](proto/ledger/v1/ledger.proto). Regenerate
+the Go bindings after editing the proto file with:
+
+```sh
+protoc -I proto \
+  --go_out=gen --go_opt=paths=source_relative \
+  --go-grpc_out=gen --go-grpc_opt=paths=source_relative \
+  proto/ledger/v1/ledger.proto
+```
+
+### Integration tests
+
+The Postgres integration test runs against a real database and is skipped
+unless `MERIDIAN_TEST_DATABASE_URL` points at a scratch database (the
+test truncates the ledger tables, so never point it at real data):
+
+```sh
+MERIDIAN_TEST_DATABASE_URL=postgres://postgres@localhost:5432/meridian_test \
+  go test ./internal/store/ -run TestPostgresStoreIntegration -v
+```
 
 ## Roadmap summary
 
 - **Day 1** — Scaffold, double-entry core with invariant + idempotency
   enforcement, in-memory store, unit tests, CI. ✅
 - **Day 2** — HTTP + gRPC APIs, Postgres store (pgx), optimistic
-  concurrency, integration tests.
+  concurrency, integration tests. ✅
 - **Day 3** — Transactional outbox → Kafka/Redpanda streaming, consumers
   with deduplication and dead-letter handling.
 - **Day 4** — Observability (Prometheus metrics, structured logs, tracing

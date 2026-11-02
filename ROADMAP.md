@@ -21,12 +21,12 @@ working, tested system — no "big bang" integration at the end.
 
 ## Day 2 — APIs and real persistence
 
-- [ ] HTTP API: create account, post transaction, get balance, get transaction
-- [ ] gRPC API with protobuf definitions mirroring the HTTP surface
-- [ ] Postgres store with pgx: schema migrations, posting in a single DB
+- [x] HTTP API: create account, post transaction, get balance, get transaction
+- [x] gRPC API with protobuf definitions mirroring the HTTP surface
+- [x] Postgres store with pgx: schema migrations, posting in a single DB
       transaction, unique constraint on idempotency keys
-- [ ] Optimistic concurrency for balance snapshots
-- [ ] Integration tests against a real Postgres (testcontainers or compose)
+- [x] Optimistic concurrency for balance snapshots
+- [x] Integration tests against a real Postgres (testcontainers or compose)
 
 ## Day 3 — Event streaming
 
