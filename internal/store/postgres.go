@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/tandrysyawaludin/meridian-ledger/internal/events"
 	"github.com/tandrysyawaludin/meridian-ledger/internal/ledger"
 )
 
@@ -57,7 +59,7 @@ func (p *PostgresStore) Close() { p.pool.Close() }
 // MERIDIAN_TEST_DATABASE_URL; it must never be called against a database
 // holding real data.
 func (p *PostgresStore) TruncateForTest(ctx context.Context) error {
-	_, err := p.pool.Exec(ctx, `TRUNCATE entries, transactions, accounts RESTART IDENTITY CASCADE`)
+	_, err := p.pool.Exec(ctx, `TRUNCATE entries, transactions, accounts, outbox_events RESTART IDENTITY CASCADE`)
 	return err
 }
 
@@ -85,10 +87,14 @@ func (p *PostgresStore) Account(ctx context.Context, id string) (ledger.Account,
 }
 
 // SaveTransaction appends a transaction to the journal in a single database
-// transaction: the transaction row, every entry, and one version bump per
-// distinct account touched. A unique-violation on the idempotency key maps
-// to ErrIdempotencyConflict; a foreign-key failure (unknown account) maps
-// to ErrAccountNotFound.
+// transaction: the transaction row, every entry, one version bump per
+// distinct account touched, and one outbox row per distinct account
+// touched. The outbox rows commit atomically with the journal write —
+// that is the whole point of the transactional outbox: a crash anywhere
+// in this function leaves either the posting and its events, or neither.
+// A unique-violation on the idempotency key maps to
+// ErrIdempotencyConflict; a foreign-key failure (unknown account) maps to
+// ErrAccountNotFound.
 func (p *PostgresStore) SaveTransaction(ctx context.Context, tx ledger.Transaction) error {
 	dbTx, err := p.pool.Begin(ctx)
 	if err != nil {
@@ -126,7 +132,72 @@ func (p *PostgresStore) SaveTransaction(ctx context.Context, tx ledger.Transacti
 			return err
 		}
 	}
+	// Outbox fan-out, in the same database transaction: one event per
+	// distinct account, in first-touch order. A failure here rolls back
+	// the journal write too, so events and transactions never diverge.
+	emitted := make(map[string]bool)
+	for _, e := range tx.Entries {
+		if emitted[e.AccountID] {
+			continue
+		}
+		emitted[e.AccountID] = true
+		event, err := events.NewTransactionPosted(tx, e.AccountID)
+		if err != nil {
+			return err
+		}
+		payload, err := json.Marshal(event)
+		if err != nil {
+			return fmt.Errorf("store: marshal outbox event %s: %w", event.ID, err)
+		}
+		if _, err := dbTx.Exec(ctx,
+			`INSERT INTO outbox_events (event_id, event_type, transaction_id, account_id, payload, partition_key, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			event.ID, event.Type, event.TransactionID, event.AccountID, payload, event.PartitionKey(), event.CreatedAt); err != nil {
+			return err
+		}
+	}
 	return dbTx.Commit(ctx)
+}
+
+// PendingOutbox returns unpublished outbox records in sequence order,
+// capped at limit. The relay publishes them in exactly this order.
+func (p *PostgresStore) PendingOutbox(ctx context.Context, limit int) ([]events.OutboxRecord, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT seq, payload FROM outbox_events
+		  WHERE published_at IS NULL ORDER BY seq LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []events.OutboxRecord
+	for rows.Next() {
+		var record events.OutboxRecord
+		var payload []byte
+		if err := rows.Scan(&record.Seq, &payload); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(payload, &record.Event); err != nil {
+			return nil, fmt.Errorf("store: unmarshal outbox event seq %d: %w", record.Seq, err)
+		}
+		out = append(out, record)
+	}
+	return out, rows.Err()
+}
+
+// MarkOutboxPublished stamps an outbox record as published so the relay
+// never picks it up again.
+func (p *PostgresStore) MarkOutboxPublished(ctx context.Context, seq int64) error {
+	_, err := p.pool.Exec(ctx,
+		`UPDATE outbox_events SET published_at = now() WHERE seq = $1`, seq)
+	return err
+}
+
+// MarkOutboxAttempt counts one failed publish attempt for seq. The record
+// stays unpublished, so the relay retries it on the next poll.
+func (p *PostgresStore) MarkOutboxAttempt(ctx context.Context, seq int64) error {
+	_, err := p.pool.Exec(ctx,
+		`UPDATE outbox_events SET attempts = attempts + 1 WHERE seq = $1`, seq)
+	return err
 }
 
 // Transaction returns a single journal entry by ID.

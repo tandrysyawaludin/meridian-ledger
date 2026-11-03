@@ -118,6 +118,35 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		t.Fatalf("snapshot after second posting = %+v err=%v, want balance 7500 version 2", snap, err)
 	}
 
+	// Outbox: two postings across two accounts produced one event per
+	// leg (four rows), in sequence order, and marking one published
+	// removes exactly that row from the pending set.
+	pending, err := pg.PendingOutbox(ctx, 100)
+	if err != nil || len(pending) != 4 {
+		t.Fatalf("pending outbox = %d, err=%v, want 4", len(pending), err)
+	}
+	for i := 1; i < len(pending); i++ {
+		if pending[i].Seq <= pending[i-1].Seq {
+			t.Fatalf("pending outbox not in sequence order: %+v", pending)
+		}
+	}
+	if pending[0].Event.AccountID != cash || pending[1].Event.AccountID != revenue {
+		t.Fatalf("first posting legs = %q, %q, want cash then revenue",
+			pending[0].Event.AccountID, pending[1].Event.AccountID)
+	}
+	if err := pg.MarkOutboxAttempt(ctx, pending[0].Seq); err != nil {
+		t.Fatalf("mark attempt: %v", err)
+	}
+	if pending, err := pg.PendingOutbox(ctx, 100); err != nil || len(pending) != 4 {
+		t.Fatalf("pending after attempt = %d, err=%v, want still 4", len(pending), err)
+	}
+	if err := pg.MarkOutboxPublished(ctx, pending[0].Seq); err != nil {
+		t.Fatalf("mark published: %v", err)
+	}
+	if pending, err := pg.PendingOutbox(ctx, 100); err != nil || len(pending) != 3 {
+		t.Fatalf("pending after publish = %d, err=%v, want 3", len(pending), err)
+	}
+
 	// Posting against an unknown account is rejected, and the failed
 	// posting leaves no trace in the journal.
 	if _, err := svc.Post(ctx, ledger.PostRequest{
@@ -131,6 +160,11 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	}
 	if _, found, err := pg.TransactionByIdempotencyKey(ctx, "bad-1"); err != nil || found {
 		t.Fatalf("failed posting persisted: found=%v err=%v", found, err)
+	}
+	// The failed posting also enqueued no outbox rows: the atomic
+	// posting transaction rolled everything back together.
+	if pending, err := pg.PendingOutbox(ctx, 100); err != nil || len(pending) != 3 {
+		t.Fatalf("pending outbox after failed posting = %d, err=%v, want still 3", len(pending), err)
 	}
 }
 

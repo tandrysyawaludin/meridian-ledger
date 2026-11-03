@@ -4,8 +4,18 @@ import (
 	"context"
 	"sync"
 
+	"github.com/tandrysyawaludin/meridian-ledger/internal/events"
 	"github.com/tandrysyawaludin/meridian-ledger/internal/ledger"
 )
+
+// memoryOutboxRow is one outbox record plus its relay bookkeeping. It is
+// kept separate from events.OutboxRecord so the published flag and the
+// attempt count never leak into the published event itself.
+type memoryOutboxRow struct {
+	record    events.OutboxRecord
+	published bool
+	attempts  int
+}
 
 // MemoryStore is a goroutine-safe, in-memory Store. It keeps the journal in
 // insertion order and indexes transactions by idempotency key, mirroring the
@@ -19,6 +29,8 @@ type MemoryStore struct {
 	byKey    map[string]int   // idempotency key -> index into journal
 	byID     map[string]int   // transaction id -> index into journal
 	versions map[string]int64 // account id -> optimistic-concurrency version
+	outbox   []memoryOutboxRow
+	nextSeq  int64
 }
 
 // NewMemoryStore returns an empty in-memory store.
@@ -56,6 +68,12 @@ func (m *MemoryStore) Account(_ context.Context, id string) (ledger.Account, err
 // SaveTransaction appends a transaction to the journal. The journal is
 // append-only: entries are deep-copied on the way in so later mutation of
 // the caller's slice cannot rewrite history.
+//
+// The outbox write happens under the same lock, in the same critical
+// section, as the journal write: one outbox record per distinct account
+// touched, in first-touch order. That is the in-memory equivalent of the
+// Postgres store's single-database-transaction posting, so a transaction
+// and its events are never visible separately.
 func (m *MemoryStore) SaveTransaction(_ context.Context, tx ledger.Transaction) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -73,6 +91,68 @@ func (m *MemoryStore) SaveTransaction(_ context.Context, tx ledger.Transaction) 
 		}
 	}
 	m.journal = append(m.journal, stored)
+	// Build the fan-out events in first-touch order, skipping accounts
+	// already emitted for this transaction.
+	emitted := make(map[string]bool)
+	for _, e := range tx.Entries {
+		if emitted[e.AccountID] {
+			continue
+		}
+		emitted[e.AccountID] = true
+		event, err := events.NewTransactionPosted(tx, e.AccountID)
+		if err != nil {
+			return err
+		}
+		m.nextSeq++
+		m.outbox = append(m.outbox, memoryOutboxRow{
+			record: events.OutboxRecord{Seq: m.nextSeq, Event: event},
+		})
+	}
+	return nil
+}
+
+// PendingOutbox returns unpublished outbox records in sequence order,
+// capped at limit.
+func (m *MemoryStore) PendingOutbox(_ context.Context, limit int) ([]events.OutboxRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []events.OutboxRecord
+	for _, row := range m.outbox {
+		if row.published {
+			continue
+		}
+		out = append(out, row.record)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// MarkOutboxPublished marks the outbox record with seq as published.
+func (m *MemoryStore) MarkOutboxPublished(_ context.Context, seq int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.outbox {
+		if m.outbox[i].record.Seq == seq {
+			m.outbox[i].published = true
+			return nil
+		}
+	}
+	return nil
+}
+
+// MarkOutboxAttempt records one failed publish attempt for seq. The
+// record stays unpublished, so the relay retries it on the next poll.
+func (m *MemoryStore) MarkOutboxAttempt(_ context.Context, seq int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.outbox {
+		if m.outbox[i].record.Seq == seq {
+			m.outbox[i].attempts++
+			return nil
+		}
+	}
 	return nil
 }
 

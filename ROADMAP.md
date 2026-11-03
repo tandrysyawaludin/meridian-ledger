@@ -30,10 +30,10 @@ working, tested system — no "big bang" integration at the end.
 
 ## Day 3 — Event streaming
 
-- [ ] Transactional outbox: journal writes and outbox rows commit atomically
-- [ ] Outbox relay publishing to Kafka/Redpanda
-- [ ] Reference consumer with deduplication and dead-letter handling
-- [ ] Ordering guarantees per account documented and tested
+- [x] Transactional outbox: journal writes and outbox rows commit atomically
+- [x] Outbox relay publishing to Kafka/Redpanda
+- [x] Reference consumer with deduplication and dead-letter handling
+- [x] Ordering guarantees per account documented and tested
 
 ## Day 4 — Operability and load
 

@@ -11,6 +11,7 @@ package store
 import (
 	"context"
 
+	"github.com/tandrysyawaludin/meridian-ledger/internal/events"
 	"github.com/tandrysyawaludin/meridian-ledger/internal/ledger"
 )
 
@@ -25,6 +26,13 @@ type Store interface {
 	TransactionByIdempotencyKey(ctx context.Context, key string) (tx ledger.Transaction, found bool, err error)
 	TransactionsForAccount(ctx context.Context, accountID string) ([]ledger.Transaction, error)
 	BalanceSnapshot(ctx context.Context, accountID string) (ledger.BalanceSnapshot, error)
+	// Outbox methods: the transactional outbox (Day 3). SaveTransaction
+	// appends one outbox record per distinct account touched, atomically
+	// with the journal write, so an event can never exist without its
+	// transaction or vice versa.
+	PendingOutbox(ctx context.Context, limit int) ([]events.OutboxRecord, error)
+	MarkOutboxPublished(ctx context.Context, seq int64) error
+	MarkOutboxAttempt(ctx context.Context, seq int64) error
 }
 
 // Compile-time checks that both backends satisfy the contract.

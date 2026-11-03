@@ -42,8 +42,10 @@ flowchart LR
     SVC --> Repo[(Repository port)]
     Repo --> Mem[In-memory store<br/>tests / local dev]
     Repo --> PG[(Postgres store<br/>pgx)]
-    SVC -.->|transactional outbox — Day 3| Outbox[Event stream<br/>Kafka / Redpanda]
-    Outbox --> Consumers[Downstream consumers<br/>dedup + DLQ]
+    Repo --> Outbox[(Transactional outbox<br/>same DB tx as journal)]
+    Outbox --> Relay[Outbox relay<br/>sequence order]
+    Relay -->|Kafka / Redpanda<br/>keyed by account| Stream[Event stream]
+    Stream --> Consumers[Downstream consumers<br/>dedup + DLQ]
     SVC -.-> Metrics[Metrics / logs / traces — Day 4]
 ```
 
@@ -60,7 +62,10 @@ internal/ledger/     Double-entry domain: accounts, entries, transactions,
                      invariant + idempotency enforcement, balance derivation,
                      versioned balance snapshots
 internal/store/      Store interface, in-memory implementation, pgx Postgres
-                     implementation (schema in internal/store/schema.sql)
+                     implementation (schema in internal/store/schema.sql),
+                     transactional outbox in both backends
+internal/events/     Event model (one event per account leg), outbox relay
+                     to Kafka/Redpanda, reference consumer with dedup + DLQ
 internal/api/        HTTP JSON API (same contract as the gRPC surface)
 internal/grpcapi/    gRPC adapter over the generated protobuf service
 gen/ledger/v1/       Generated protobuf + gRPC code (from proto/ledger/v1/)
@@ -108,7 +113,24 @@ curl localhost:8080/healthz
 Configuration: `PORT` sets the HTTP listen port (default `8080`),
 `GRPC_PORT` the gRPC port (default `9090`), and `DATABASE_URL` selects
 the Postgres store (a Postgres connection string). When `DATABASE_URL`
-is unset, the in-memory store is used.
+is unset, the in-memory store is used. `KAFKA_BROKERS` (comma-separated)
+starts the outbox relay publishing to `KAFKA_TOPIC` (default
+`meridian-ledger-events`); without it, events accumulate unpublished in
+the outbox and a later brokered run publishes them in order. See
+[`docs/EVENTS.md`](docs/EVENTS.md) for the delivery contract: at-least-once
+delivery with consumer deduplication, per-account ordering, and
+dead-letter handling.
+
+### Event streaming
+
+Every posting is fanned out into one `ledger.transaction.posted.v1`
+event per account it touches, keyed by that account so each account's
+events stay ordered on the broker. The outbox rows commit in the same
+database transaction as the journal write, so an event can never exist
+without its transaction. Downstream, the reference consumer in
+`internal/events` deduplicates on the deterministic event ID, retries a
+failing handler (default 3 attempts), then dead-letters the event instead
+of looping on it.
 
 ### API
 
@@ -158,7 +180,7 @@ MERIDIAN_TEST_DATABASE_URL=postgres://postgres@localhost:5432/meridian_test \
 - **Day 2** — HTTP + gRPC APIs, Postgres store (pgx), optimistic
   concurrency, integration tests. ✅
 - **Day 3** — Transactional outbox → Kafka/Redpanda streaming, consumers
-  with deduplication and dead-letter handling.
+  with deduplication and dead-letter handling. ✅
 - **Day 4** — Observability (Prometheus metrics, structured logs, tracing
   hooks), rate limiting, graceful shutdown, load-test harness with published
   benchmark numbers.

@@ -39,3 +39,29 @@ CREATE TABLE IF NOT EXISTS entries (
 );
 
 CREATE INDEX IF NOT EXISTS entries_account_idx ON entries (account_id, transaction_id);
+
+-- Transactional outbox (Day 3).
+--
+-- One row per published event, written in the same database transaction
+-- as the journal posting (see PostgresStore.SaveTransaction), so a crash
+-- can never produce a journal entry without its event or an event without
+-- its journal entry. The relay publishes rows in seq order and stamps
+-- published_at; unpublished rows are exactly the relay's work queue.
+-- event_id is UNIQUE so a replayed posting can never double-enqueue an
+-- event, and partition_key is the leg's account, which is what the Kafka
+-- publisher keys on to preserve per-account order on the broker.
+CREATE TABLE IF NOT EXISTS outbox_events (
+    seq            BIGSERIAL PRIMARY KEY,
+    event_id       TEXT NOT NULL UNIQUE,
+    event_type     TEXT NOT NULL,
+    transaction_id TEXT NOT NULL REFERENCES transactions (id),
+    account_id     TEXT NOT NULL REFERENCES accounts (id),
+    payload        JSONB NOT NULL,
+    partition_key  TEXT NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL,
+    published_at   TIMESTAMPTZ,
+    attempts       INT NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS outbox_unpublished_idx
+    ON outbox_events (seq) WHERE published_at IS NULL;
