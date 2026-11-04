@@ -18,31 +18,84 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/tandrysyawaludin/meridian-ledger/internal/ledger"
+	"github.com/tandrysyawaludin/meridian-ledger/internal/metrics"
+	"github.com/tandrysyawaludin/meridian-ledger/internal/tracing"
 )
 
 // Handler serves the ledger HTTP API.
 type Handler struct {
-	svc *ledger.Service
-	mux *http.ServeMux
+	svc     *ledger.Service
+	mux     *http.ServeMux
+	metrics *metrics.Registry
+	logger  *slog.Logger
+	tracer  tracing.Tracer
+	limiter *RateLimiter
+	chain   http.Handler
 }
 
-// NewHandler returns an http.Handler serving the ledger API on top of svc.
+// Options configures a Handler. Zero values are safe: metrics default to
+// a fresh registry, logging to slog.Default, tracing to the no-op tracer,
+// and rate limiting to disabled.
+type Options struct {
+	Metrics   *metrics.Registry
+	Logger    *slog.Logger
+	Tracer    tracing.Tracer
+	RateLimit RateLimitConfig
+}
+
+// NewHandler returns an http.Handler serving the ledger API on top of svc,
+// with default observability options (fresh metrics registry, default
+// logger, no-op tracing, no rate limiting).
 func NewHandler(svc *ledger.Service) http.Handler {
-	h := &Handler{svc: svc, mux: http.NewServeMux()}
+	return NewHandlerWithOptions(svc, Options{})
+}
+
+// NewHandlerWithOptions returns a Handler like NewHandler but with the
+// given observability wiring. The returned handler's Metrics registry is
+// the one callers should expose on /metrics; see Metrics().
+func NewHandlerWithOptions(svc *ledger.Service, opts Options) *Handler {
+	h := &Handler{
+		svc:     svc,
+		mux:     http.NewServeMux(),
+		metrics: opts.Metrics,
+		logger:  opts.Logger,
+		tracer:  opts.Tracer,
+		limiter: NewRateLimiter(opts.RateLimit),
+	}
+	if h.metrics == nil {
+		h.metrics = metrics.NewRegistry()
+	}
+	if h.logger == nil {
+		h.logger = slog.Default()
+	}
+	if h.tracer == nil {
+		h.tracer = tracing.NoopTracer{}
+	}
 	h.mux.HandleFunc("POST /accounts", h.createAccount)
 	h.mux.HandleFunc("GET /accounts/{id}", h.getAccount)
 	h.mux.HandleFunc("GET /accounts/{id}/balance", h.getBalance)
 	h.mux.HandleFunc("POST /transactions", h.postTransaction)
 	h.mux.HandleFunc("GET /transactions/{id}", h.getTransaction)
+	// Middleware order is deliberate: request ID first so every later
+	// layer (logging, rate-limit responses) can carry it.
+	h.chain = requestIDMiddleware(
+		loggingMiddleware(h.logger)(
+			tracingMiddleware(h.tracer)(
+				rateLimitMiddleware(h.limiter)(h.mux))))
 	return h
 }
 
+// Metrics returns the registry this handler records into, for mounting on
+// /metrics by the service entry point.
+func (h *Handler) Metrics() *metrics.Registry { return h.metrics }
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mux.ServeHTTP(w, r)
+	h.chain.ServeHTTP(w, r)
 }
 
 // JSON wire shapes. Field names match the protobuf surface (snake_case)
@@ -164,9 +217,14 @@ func (h *Handler) postTransaction(w http.ResponseWriter, r *http.Request) {
 	for i, e := range req.Entries {
 		entries[i] = ledger.Entry{AccountID: e.AccountID, Direction: ledger.Direction(e.Direction), Amount: e.AmountMinor}
 	}
+	start := time.Now()
 	tx, err := h.svc.Post(r.Context(), ledger.PostRequest{
 		IdempotencyKey: req.IdempotencyKey, Memo: req.Memo, Entries: entries,
 	})
+	// Metrics cover every posting attempt, including rejections: a
+	// rejection is the interesting signal, not something to hide from
+	// the latency and rejection series.
+	h.metrics.ObservePost(time.Since(start), err)
 	if err != nil {
 		writeError(w, err)
 		return

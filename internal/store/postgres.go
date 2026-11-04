@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -198,6 +199,24 @@ func (p *PostgresStore) MarkOutboxAttempt(ctx context.Context, seq int64) error 
 	_, err := p.pool.Exec(ctx,
 		`UPDATE outbox_events SET attempts = attempts + 1 WHERE seq = $1`, seq)
 	return err
+}
+
+// OutboxStats reports the relay backlog: how many outbox records are
+// unpublished, and the creation time of the oldest one. found is false
+// when nothing is pending. The partial index on unpublished rows keeps
+// this cheap even with a large published history behind it.
+func (p *PostgresStore) OutboxStats(ctx context.Context) (pending int, oldest time.Time, found bool, err error) {
+	var oldestPtr *time.Time
+	err = p.pool.QueryRow(ctx,
+		`SELECT COUNT(*), MIN(created_at) FROM outbox_events WHERE published_at IS NULL`).
+		Scan(&pending, &oldestPtr)
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	if oldestPtr != nil {
+		return pending, *oldestPtr, true, nil
+	}
+	return 0, time.Time{}, false, nil
 }
 
 // Transaction returns a single journal entry by ID.

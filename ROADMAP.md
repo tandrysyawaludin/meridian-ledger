@@ -37,12 +37,12 @@ working, tested system — no "big bang" integration at the end.
 
 ## Day 4 — Operability and load
 
-- [ ] Prometheus metrics: posting latency, rejections by reason, outbox lag
-- [ ] Structured logging throughout, request-scoped log fields
-- [ ] Tracing hooks (OpenTelemetry interfaces, no-op by default)
-- [ ] Rate limiting on the posting API
-- [ ] Graceful shutdown for HTTP, gRPC and the outbox relay
-- [ ] Load-test harness; benchmark numbers published in the README
+- [x] Prometheus metrics: posting latency, rejections by reason, outbox lag
+- [x] Structured logging throughout, request-scoped log fields
+- [x] Tracing hooks (OpenTelemetry interfaces, no-op by default)
+- [x] Rate limiting on the posting API
+- [x] Graceful shutdown for HTTP, gRPC and the outbox relay
+- [x] Load-test harness; benchmark numbers published in the README
 
 ## Day 5 — Shipping shape
 

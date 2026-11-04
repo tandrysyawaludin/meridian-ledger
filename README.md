@@ -46,7 +46,7 @@ flowchart LR
     Outbox --> Relay[Outbox relay<br/>sequence order]
     Relay -->|Kafka / Redpanda<br/>keyed by account| Stream[Event stream]
     Stream --> Consumers[Downstream consumers<br/>dedup + DLQ]
-    SVC -.-> Metrics[Metrics / logs / traces — Day 4]
+    SVC -.-> Obs[Metrics / logs / traces<br/>GET /metrics, JSON logs, tracing seam]
 ```
 
 The domain package (`internal/ledger`) has no dependency on any storage or
@@ -57,7 +57,9 @@ exercise exactly the same invariant and idempotency logic.
 ## Layout
 
 ```
-cmd/meridian/        Service entry point (HTTP + gRPC servers, health endpoints)
+cmd/meridian/        Service entry point (HTTP + gRPC servers, health endpoints,
+                     /metrics, coordinated shutdown)
+cmd/loadtest/        Black-box load-test harness (HTTP postings, latency percentiles)
 internal/ledger/     Double-entry domain: accounts, entries, transactions,
                      invariant + idempotency enforcement, balance derivation,
                      versioned balance snapshots
@@ -66,8 +68,13 @@ internal/store/      Store interface, in-memory implementation, pgx Postgres
                      transactional outbox in both backends
 internal/events/     Event model (one event per account leg), outbox relay
                      to Kafka/Redpanda, reference consumer with dedup + DLQ
-internal/api/        HTTP JSON API (same contract as the gRPC surface)
-internal/grpcapi/    gRPC adapter over the generated protobuf service
+internal/api/        HTTP JSON API (same contract as the gRPC surface),
+                     request-ID / logging / tracing middleware, posting rate limiter
+internal/grpcapi/    gRPC adapter over the generated protobuf service,
+                     logging / tracing / metrics interceptors
+internal/metrics/    Prometheus exposition (dependency-free): posting latency,
+                     rejections by reason, outbox lag gauges
+internal/tracing/    Tracing seam: Tracer/Span interfaces, no-op default
 gen/ledger/v1/       Generated protobuf + gRPC code (from proto/ledger/v1/)
 proto/ledger/v1/     Protobuf service definition (source of truth)
 ```
@@ -119,7 +126,11 @@ starts the outbox relay publishing to `KAFKA_TOPIC` (default
 the outbox and a later brokered run publishes them in order. See
 [`docs/EVENTS.md`](docs/EVENTS.md) for the delivery contract: at-least-once
 delivery with consumer deduplication, per-account ordering, and
-dead-letter handling.
+dead-letter handling. `POST_RATE_LIMIT_RPS` (default `100`) and
+`POST_RATE_LIMIT_BURST` (default `200`) configure per-IP rate limiting
+on the posting API (`0` disables it). `GET /metrics` serves Prometheus
+metrics. Full operability detail — series, log fields, tracing seam,
+shutdown order — is in [`docs/OPERABILITY.md`](docs/OPERABILITY.md).
 
 ### Event streaming
 
@@ -162,6 +173,42 @@ protoc -I proto \
   proto/ledger/v1/ledger.proto
 ```
 
+### Benchmarks
+
+Measured 2026-11-04 on the dev VM (AMD EPYC, in-memory store, single
+instance, localhost client). These are a throughput ceiling for the
+in-memory path, not a capacity promise — Postgres numbers will be
+lower, and production capacity needs a test against the real topology.
+
+**HTTP load test** (`cmd/loadtest`, 16 workers, 10s, rate limiting
+disabled, every posting a unique idempotency key):
+
+```
+loadtest: 65902 requests in 10.05s (6556.6 req/s)
+  created: 65902  rate-limited: 0  errors: 0
+  latency: p50=1.48ms p95=5.01ms p99=31.52ms max=89.48ms
+```
+
+The p99 tail is scheduling and GC under contention, not the posting
+path itself: the in-domain benchmark below posts in under 4µs. The
+service serializes postings on one mutex (the idempotency
+check-and-insert), so throughput here is effectively single-core
+posting throughput plus HTTP overhead — sharding that lock is the
+obvious next scaling step if throughput ever becomes the constraint.
+
+**In-domain benchmarks** (`go test -bench=. ./internal/ledger/`,
+journal of 1,000 postings for the snapshot benchmark):
+
+```
+BenchmarkPost-4               379604    3771 ns/op
+BenchmarkBalanceSnapshot-4    143743    8362 ns/op
+```
+
+With default rate limiting on (100 req/s, burst 200 per IP), the same
+16-worker load test from one machine — one shared IP bucket — yielded
+700 created and 34,702 rate-limited requests with 0 errors, which is
+the limiter doing exactly what it is for.
+
 ### Integration tests
 
 The Postgres integration test runs against a real database and is skipped
@@ -183,7 +230,7 @@ MERIDIAN_TEST_DATABASE_URL=postgres://postgres@localhost:5432/meridian_test \
   with deduplication and dead-letter handling. ✅
 - **Day 4** — Observability (Prometheus metrics, structured logs, tracing
   hooks), rate limiting, graceful shutdown, load-test harness with published
-  benchmark numbers.
+  benchmark numbers. ✅
 - **Day 5** — Docker + Kubernetes manifests, docker-compose full stack,
   failure-injection tests, results polish.
 

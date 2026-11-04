@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 )
 
@@ -52,6 +53,12 @@ type Relay struct {
 	Publisher    Publisher
 	BatchSize    int           // events per poll; default 100
 	PollInterval time.Duration // delay between polls in Run; default 1s
+	// Logger, when set, receives one warning per failed poll. Poll
+	// errors are not fatal — the failed event stays unpublished and the
+	// next tick retries it — but silently swallowing them would hide a
+	// broker outage from operators, so a configured logger hears about
+	// every one. A nil logger keeps the old silent behaviour.
+	Logger *slog.Logger
 }
 
 // batchSize returns the configured batch size, or the default.
@@ -106,7 +113,9 @@ func (r *Relay) Run(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		_, _ = r.RunOnce(ctx)
+		if _, err := r.RunOnce(ctx); err != nil && r.Logger != nil {
+			r.Logger.Warn("outbox relay poll failed, retrying next tick", "err", err)
+		}
 		select {
 		case <-ctx.Done():
 			return

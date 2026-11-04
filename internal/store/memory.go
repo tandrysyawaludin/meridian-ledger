@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/tandrysyawaludin/meridian-ledger/internal/events"
 	"github.com/tandrysyawaludin/meridian-ledger/internal/ledger"
@@ -154,6 +155,28 @@ func (m *MemoryStore) MarkOutboxAttempt(_ context.Context, seq int64) error {
 		}
 	}
 	return nil
+}
+
+// OutboxStats reports the relay backlog: how many outbox records are
+// unpublished, and the creation time of the oldest one. found is false
+// when nothing is pending, in which case oldest is the zero time. The
+// service's lag reporter polls this to feed the outbox gauges; it is a
+// scan of the in-memory outbox, which is fine at this scale because the
+// outbox is bounded by the relay's drain rate in practice.
+func (m *MemoryStore) OutboxStats(_ context.Context) (pending int, oldest time.Time, found bool, err error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, row := range m.outbox {
+		if row.published {
+			continue
+		}
+		pending++
+		if !found || row.record.Event.CreatedAt.Before(oldest) {
+			oldest = row.record.Event.CreatedAt
+			found = true
+		}
+	}
+	return pending, oldest, found, nil
 }
 
 // Transaction returns a single journal entry by ID.

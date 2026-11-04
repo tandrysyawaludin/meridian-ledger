@@ -10,6 +10,7 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"github.com/tandrysyawaludin/meridian-ledger/internal/events"
 	"github.com/tandrysyawaludin/meridian-ledger/internal/ledger"
@@ -33,6 +34,10 @@ type Store interface {
 	PendingOutbox(ctx context.Context, limit int) ([]events.OutboxRecord, error)
 	MarkOutboxPublished(ctx context.Context, seq int64) error
 	MarkOutboxAttempt(ctx context.Context, seq int64) error
+	// OutboxStats reports the relay backlog for the outbox gauges (Day 4):
+	// how many records are unpublished, and the oldest one's creation
+	// time. found is false when nothing is pending.
+	OutboxStats(ctx context.Context) (pending int, oldest time.Time, found bool, err error)
 }
 
 // Compile-time checks that both backends satisfy the contract.
