@@ -1,0 +1,16 @@
+# Non-secret configuration for the Deployment. DATABASE_URL is deliberately
+# NOT here: it carries credentials and comes from the meridian-ledger-db
+# Secret (see deployment.yaml and docs/DEPLOYMENT.md).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meridian-ledger
+  labels:
+    app: meridian-ledger
+data:
+  PORT: "8080"
+  GRPC_PORT: "9090"
+  KAFKA_BROKERS: "redpanda:9092"
+  KAFKA_TOPIC: "meridian-ledger-events"
+  POST_RATE_LIMIT_RPS: "100"
+  POST_RATE_LIMIT_BURST: "200"

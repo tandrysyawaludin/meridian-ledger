@@ -1,0 +1,81 @@
+# Deployment for Meridian Ledger.
+#
+# Replicas MUST stay at 1 while the outbox relay runs in-process: the relay
+# is documented as single-instance (see internal/events/outbox.go), and two
+# relays draining the same outbox could interleave batches and break
+# per-account ordering. Scale the API only after moving the relay out of
+# the service or adding relay leadership; the HPA in hpa.yaml is provided
+# for that future shape and must not be applied to this Deployment as-is
+# with maxReplicas above 1.
+#
+# Before applying, create the Secret the Deployment references (the
+# operator owns the real credentials; nothing secret is checked in):
+#
+#   kubectl create secret generic meridian-ledger-db \
+#     --from-literal=database-url='postgres://USER:PASSWORD@HOST:5432/meridian?sslmode=require'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meridian-ledger
+  labels:
+    app: meridian-ledger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: meridian-ledger
+  template:
+    metadata:
+      labels:
+        app: meridian-ledger
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: meridian
+          # Replace with the image you actually publish, e.g.
+          # ghcr.io/<owner>/meridian-ledger:<tag>.
+          image: meridian-ledger:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 9090
+          envFrom:
+            - configMapRef:
+                name: meridian-ledger
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: meridian-ledger-db
+                  key: database-url
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

@@ -9,8 +9,8 @@ journal, and every posting is safe to retry. It is built to demonstrate the
 properties a real ledger must have — correctness first, then throughput —
 rather than to be a CRUD demo.
 
-> Status: under active development. See [ROADMAP.md](ROADMAP.md) for the
-> build plan and what has landed so far.
+> Status: the five-day build is complete. See [ROADMAP.md](ROADMAP.md)
+> for the build plan and what landed each day.
 
 ## Why this exists
 
@@ -67,7 +67,8 @@ internal/store/      Store interface, in-memory implementation, pgx Postgres
                      implementation (schema in internal/store/schema.sql),
                      transactional outbox in both backends
 internal/events/     Event model (one event per account leg), outbox relay
-                     to Kafka/Redpanda, reference consumer with dedup + DLQ
+                     to Kafka/Redpanda, reference consumer with dedup + DLQ,
+                     failure-injection tests (duplicate delivery, crash/restart)
 internal/api/        HTTP JSON API (same contract as the gRPC surface),
                      request-ID / logging / tracing middleware, posting rate limiter
 internal/grpcapi/    gRPC adapter over the generated protobuf service,
@@ -77,7 +78,79 @@ internal/metrics/    Prometheus exposition (dependency-free): posting latency,
 internal/tracing/    Tracing seam: Tracer/Span interfaces, no-op default
 gen/ledger/v1/       Generated protobuf + gRPC code (from proto/ledger/v1/)
 proto/ledger/v1/     Protobuf service definition (source of truth)
+Dockerfile           Multi-stage build: Go builder, distroless non-root runtime
+docker-compose.yml   Local full stack: service + Postgres + Redpanda
+deploy/k8s/          Kubernetes manifests: Deployment, Service, ConfigMap,
+                     probes, HPA (see docs/DEPLOYMENT.md for the 1-replica rule)
+docs/                EVENTS.md (delivery contract), OPERABILITY.md (metrics,
+                     logs, tracing, shutdown), DEPLOYMENT.md (image, compose,
+                     Kubernetes, failure modes)
 ```
+
+## Running the full stack
+
+The fastest way to see the whole system — API, durable Postgres journal,
+and real broker events — is docker-compose:
+
+```sh
+docker compose up --build
+curl localhost:8080/healthz
+# {"service":"meridian-ledger","status":"ok"}
+```
+
+For Kubernetes, see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md): manifests
+in `deploy/k8s/`, a Secret for `DATABASE_URL`, and one rule that matters
+— keep replicas at 1 while the outbox relay runs in-process, because the
+relay is single-instance by design.
+
+## End-to-end walkthrough
+
+With the full stack up (or with `go run ./cmd/meridian` for the
+in-memory variant), the whole loop — accounts, a balanced posting, a
+derived balance, and the event stream — looks like this:
+
+```sh
+# 1. Create the two sides of a sale.
+curl -X POST localhost:8080/api/accounts \
+  -d '{"id":"cash","name":"Cash","currency":"USD"}'
+curl -X POST localhost:8080/api/accounts \
+  -d '{"id":"revenue","name":"Revenue","currency":"USD"}'
+
+# 2. Post a $50.00 card sale. Retry this exact request as often as you
+#    like: the idempotency key makes every retry return the original
+#    transaction instead of double-applying it.
+curl -X POST localhost:8080/api/transactions \
+  -d '{"idempotency_key":"sale-1","memo":"card sale","entries":[
+        {"account_id":"cash","direction":"debit","amount_minor":5000},
+        {"account_id":"revenue","direction":"credit","amount_minor":5000}]}'
+
+# 3. Read the derived balance (cash is a debit-balance account, so it
+#    reads positive; revenue reads negative, a net credit balance).
+curl localhost:8080/api/accounts/cash/balance
+# {"account_id":"cash","balance_minor":5000,"currency":"USD","version":1}
+curl localhost:8080/api/accounts/revenue/balance
+# {"account_id":"revenue","balance_minor":-5000,"currency":"USD","version":1}
+
+# 4. Confirm the posting was rejected-proof: an unbalanced twin is refused.
+curl -X POST localhost:8080/api/transactions \
+  -d '{"idempotency_key":"bad-1","entries":[
+        {"account_id":"cash","direction":"debit","amount_minor":5000},
+        {"account_id":"revenue","direction":"credit","amount_minor":4999}]}'
+# {"error":"...","code":"validation"} (HTTP 400)
+
+# 5. Watch the pipeline drain: the outbox backlog gauge falls to zero as
+#    the relay publishes, and the posting counters record the outcomes.
+curl localhost:8080/metrics | grep -E 'meridian_(postings_total|outbox_pending)'
+```
+
+With docker-compose, step 5's events are also on the broker — one
+`ledger.transaction.posted.v1` event per account leg, keyed by account,
+so each account's events stay ordered. The delivery contract (at-least-once,
+consumer deduplication, dead letters) is documented in
+[`docs/EVENTS.md`](docs/EVENTS.md), and the failure modes it survives —
+database death mid-posting, duplicate deliveries, consumer and relay
+crash/restart — are covered by the failure-injection tests in
+`internal/ledger/failure_test.go` and `internal/events/failure_test.go`.
 
 ## Key design decisions
 
@@ -232,7 +305,7 @@ MERIDIAN_TEST_DATABASE_URL=postgres://postgres@localhost:5432/meridian_test \
   hooks), rate limiting, graceful shutdown, load-test harness with published
   benchmark numbers. ✅
 - **Day 5** — Docker + Kubernetes manifests, docker-compose full stack,
-  failure-injection tests, results polish.
+  failure-injection tests, results polish. ✅
 
 Full detail in [ROADMAP.md](ROADMAP.md).
 

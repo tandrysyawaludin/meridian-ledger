@@ -1,0 +1,63 @@
+# Local full-stack run: the service plus the Postgres it persists to and
+# the Redpanda broker its outbox relay publishes to. This is the stack the
+# end-to-end walkthrough in the README uses. It is a development stack:
+# credentials here are defaults for local use only, never for production.
+#
+#   docker compose up --build
+#   curl localhost:8080/healthz
+#
+# The service waits for Postgres to report healthy before starting, and
+# for Redpanda to accept connections; the outbox relay is enabled by
+# KAFKA_BROKERS, so postings made here produce real broker events.
+services:
+  meridian:
+    build: .
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      PORT: "8080"
+      GRPC_PORT: "9090"
+      DATABASE_URL: "postgres://meridian:meridian@postgres:5432/meridian?sslmode=disable"
+      KAFKA_BROKERS: "redpanda:9092"
+      KAFKA_TOPIC: "meridian-ledger-events"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_started
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: meridian
+      POSTGRES_PASSWORD: meridian
+      POSTGRES_DB: meridian
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meridian -d meridian"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --smp
+      - "1"
+      - --overprovisioned
+      - --kafka-addr
+      - internal://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - redpanda:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - redpandadata:/var/lib/redpanda/data
+
+volumes:
+  pgdata:
+  redpandadata:

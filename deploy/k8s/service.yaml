@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: meridian-ledger
+  labels:
+    app: meridian-ledger
+spec:
+  selector:
+    app: meridian-ledger
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: grpc
+      port: 9090
+      targetPort: grpc

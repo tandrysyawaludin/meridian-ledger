@@ -46,9 +46,9 @@ working, tested system — no "big bang" integration at the end.
 
 ## Day 5 — Shipping shape
 
-- [ ] Multi-stage Dockerfile and a slim runtime image
-- [ ] Kubernetes manifests: Deployment, Service, ConfigMap, probes, HPA
-- [ ] docker-compose stack: service + Postgres + Redpanda for local runs
-- [ ] Failure-injection tests: killed DB mid-posting, duplicate deliveries,
+- [x] Multi-stage Dockerfile and a slim runtime image
+- [x] Kubernetes manifests: Deployment, Service, ConfigMap, probes, HPA
+- [x] docker-compose stack: service + Postgres + Redpanda for local runs
+- [x] Failure-injection tests: killed DB mid-posting, duplicate deliveries,
       consumer crash/restart
-- [ ] README and results polish; end-to-end walkthrough
+- [x] README and results polish; end-to-end walkthrough

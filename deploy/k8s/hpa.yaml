@@ -1,0 +1,33 @@
+# HorizontalPodAutoscaler for Meridian Ledger.
+#
+# DO NOT apply this as-is while replicas: 1 is load-bearing (see the
+# note at the top of deployment.yaml): the in-process outbox relay must
+# run as a single instance. This manifest is the scaling shape for after
+# the relay is extracted or given leadership — at that point, raise
+# Deployment replicas and this HPA together.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: meridian-ledger
+  labels:
+    app: meridian-ledger
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: meridian-ledger
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
